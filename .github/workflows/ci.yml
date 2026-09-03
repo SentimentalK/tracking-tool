@@ -96,6 +96,6 @@ jobs:
           echo "==========================================================="
           echo "Container image published successfully to GHCR!"
           echo "Image Digest: ${{ steps.docker_build.outputs.digest }}"
-          echo "Immutable Tag for ArgoCD / K3s:"
-          echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}" | cut -c1-65
+          echo "Available Tags for GitOps / ArgoCD:"
+          echo "${{ steps.meta.outputs.tags }}"
           echo "==========================================================="
