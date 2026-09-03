@@ -68,3 +68,15 @@ run_daily()
 from apps.insurance.workflow import handle_action
 handle_action(raw_payload)  # supports dict, json string, form data 'payload=...', or base64
 ```
+
+---
+
+## Container & K3s / ArgoCD
+
+Multi-arch images (`linux/amd64`, `linux/arm64`) are built and pushed to GHCR via GitHub Actions.
+
+* **Registry**: `ghcr.io/sentimentalk/tracking-tool`
+* **Immutable GitOps Tag**: `ghcr.io/sentimentalk/tracking-tool:sha-<short-sha>` (avoid `:latest` in ArgoCD)
+* **K3s Deployment** (24x7 webhook): runs default CMD `uvicorn server:app --host 0.0.0.0 --port 8000`
+* **K3s CronJob** (daily sync): override with `command: ["python", "main.py"]`
+
