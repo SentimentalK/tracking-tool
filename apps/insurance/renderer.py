@@ -5,6 +5,13 @@ import pandas as pd
 class InsuranceRenderer:
     """Renderer for Insurance Slack Block Kit messages."""
 
+    INTERACTION_BLOCK_IDS = {
+        "policy_actions",
+        "policy_action_status",
+        "policy_undo",
+        "policy_conflict",
+    }
+
     def __init__(self, user_id: str = "U034EB7UKEZ", admin_id: str = "U034H72T319"):
         self.user_id = user_id
         self.admin_id = admin_id
@@ -24,27 +31,17 @@ class InsuranceRenderer:
             },
         ]
 
-        self.status_blocks: Dict[str, List[Dict[str, Any]]] = {
-            "ok": [
-                {
-                    "type": "section",
-                    "text": {"type": "plain_text", "text": ":white_check_mark: 数据同步成功"},
-                }
-            ],
-            "working": [
-                {
-                    "type": "section",
-                    "text": {"type": "plain_text", "text": ":pray: 数据同步中"},
-                }
-            ],
-            "failed": [
-                {
-                    "type": "section",
-                    "text": {"type": "plain_text", "text": ":x: 数据同步失败"},
-                },
-                {"type": "actions", "elements": self.buttons},
-            ],
-        }
+    def strip_interaction_blocks(
+        self, blocks: Optional[List[Dict[str, Any]]]
+    ) -> List[Dict[str, Any]]:
+        """Cleanly remove all interactive/status blocks using explicit block_ids."""
+        if not blocks:
+            return []
+        cleaned = [b for b in blocks if b.get("block_id") not in self.INTERACTION_BLOCK_IDS]
+        # Safety fallback for older messages that might not have block_id assigned
+        while cleaned and cleaned[-1].get("type") in ("actions",):
+            cleaned.pop()
+        return cleaned
 
     def render_reminder_card(
         self,
@@ -107,14 +104,110 @@ class InsuranceRenderer:
             },
             {
                 "type": "actions",
+                "block_id": "policy_actions",
                 "elements": self.buttons,
             },
         ]
 
+    def render_success_with_undo(
+        self,
+        original_blocks: List[Dict[str, Any]],
+        undo_value: str,
+        action_label: str = "已缴费",
+    ) -> List[Dict[str, Any]]:
+        """Render success notification with an optimistic Undo button."""
+        base = self.strip_interaction_blocks(original_blocks)
+        success_block = {
+            "type": "section",
+            "block_id": "policy_action_status",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":white_check_mark: *数据同步成功*（操作：{action_label}）",
+            },
+        }
+        undo_actions_block = {
+            "type": "actions",
+            "block_id": "policy_undo",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "emoji": True, "text": "↩️ 撤销操作 (Undo)"},
+                    "style": "danger",
+                    "value": undo_value,
+                }
+            ],
+        }
+        return base + [success_block, undo_actions_block]
+
+    def render_restored_buttons(
+        self, original_blocks: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Restore active reminder buttons after a successful Undo."""
+        base = self.strip_interaction_blocks(original_blocks)
+        restored_note = {
+            "type": "context",
+            "block_id": "policy_action_status",
+            "elements": [
+                {
+                    "type": "mrkdwn",
+                    "text": ":leftwards_arrow_with_hook: *已撤销上次操作，数据已恢复*",
+                }
+            ],
+        }
+        actions_block = {
+            "type": "actions",
+            "block_id": "policy_actions",
+            "elements": self.buttons,
+        }
+        return base + [restored_note, actions_block]
+
+    def render_conflict_message(
+        self, original_blocks: List[Dict[str, Any]], message: str
+    ) -> List[Dict[str, Any]]:
+        """Render concurrency conflict warning when Undo is refused."""
+        base = self.strip_interaction_blocks(original_blocks)
+        conflict_block = {
+            "type": "section",
+            "block_id": "policy_conflict",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":warning: *撤销失败*：{message}",
+            },
+        }
+        return base + [conflict_block]
+
     def render_updated_blocks(
         self, original_blocks: List[Dict[str, Any]], status: str
     ) -> List[Dict[str, Any]]:
-        """Replace the action block with the corresponding status block."""
-        base_blocks = original_blocks[:-1] if original_blocks else []
-        replacement = self.status_blocks.get(status, [])
-        return base_blocks + replacement
+        """Render working/failed intermediate status."""
+        base = self.strip_interaction_blocks(original_blocks)
+        if status == "working":
+            return base + [
+                {
+                    "type": "section",
+                    "block_id": "policy_action_status",
+                    "text": {"type": "plain_text", "text": ":pray: 数据同步中"},
+                }
+            ]
+        elif status == "failed":
+            return base + [
+                {
+                    "type": "section",
+                    "block_id": "policy_action_status",
+                    "text": {"type": "plain_text", "text": ":x: 数据同步失败"},
+                },
+                {
+                    "type": "actions",
+                    "block_id": "policy_actions",
+                    "elements": self.buttons,
+                },
+            ]
+        elif status == "ok":
+            return base + [
+                {
+                    "type": "section",
+                    "block_id": "policy_action_status",
+                    "text": {"type": "plain_text", "text": ":white_check_mark: 数据同步成功"},
+                }
+            ]
+        return original_blocks

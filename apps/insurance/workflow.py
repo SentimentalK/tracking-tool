@@ -1,3 +1,5 @@
+import datetime
+import json
 import logging
 import re
 from typing import Any, Dict, List, Optional, Union
@@ -9,6 +11,19 @@ from .config import InsuranceConfig
 from .renderer import InsuranceRenderer
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_val(val: Any) -> Any:
+    """Normalize values for JSON serialization and state comparisons."""
+    if pd.isna(val):
+        return None
+    if isinstance(val, (int, float, str, bool)):
+        return val
+    if hasattr(val, "item"):  # numpy types like np.int64, np.float64
+        return val.item()
+    if isinstance(val, (pd.Timestamp, datetime.date, datetime.datetime)):
+        return val.strftime("%Y-%m-%d")
+    return str(val)
 
 
 class InsuranceTracker:
@@ -167,19 +182,35 @@ class InsuranceTracker:
     def handle_action(
         self, raw_payload: Union[str, bytes, Dict[str, Any]]
     ) -> Dict[str, Any]:
-        """Handle interactive button click (paid or destory) from Slack."""
+        """Handle interactive button clicks (paid, destory, undo) from Slack."""
         payload = self.slack.parse_interactive_payload(raw_payload)
-        button = payload["actions"][0]["value"]
+        raw_value = payload["actions"][0]["value"]
+        action_data: Optional[Dict[str, Any]] = None
+
+        if raw_value in ("paid", "destory"):
+            action = raw_value
+        else:
+            try:
+                action_data = json.loads(raw_value)
+                action = action_data.get("action")
+            except Exception as e:
+                logger.warning("Could not parse action value as JSON, treating as raw string: %s", e)
+                action = raw_value
+
         blocks = payload.get("message", {}).get("blocks", [])
         response_url = payload.get("response_url")
 
-        notion_id_matches = re.findall(
-            r"notion_id:\s([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
-            str(blocks),
-        )
-        if not notion_id_matches:
-            raise ValueError("Could not extract notion_id from interactive payload blocks")
-        notion_id = notion_id_matches[0]
+        # Extract notion_id from action_data or message blocks
+        if action_data and action_data.get("notion_id"):
+            notion_id = action_data["notion_id"]
+        else:
+            notion_id_matches = re.findall(
+                r"notion_id:\s([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+                str(blocks),
+            )
+            if not notion_id_matches:
+                raise ValueError("Could not extract notion_id from interactive payload blocks")
+            notion_id = notion_id_matches[0]
 
         # Acknowledge immediately with "working" status if response_url is available
         if response_url:
@@ -187,8 +218,15 @@ class InsuranceTracker:
             self.slack.post_response(response_url, blocks=working_blocks)
 
         try:
-            match button:
-                case "paid":
+            if action in ("paid", "destory"):
+                # Snapshot prev state before applying mutations
+                prev = {
+                    "下次续费时间": _normalize_val(self.odr.df.loc[notion_id, "下次续费时间"]),
+                    "已缴次数": _normalize_val(self.odr.df.loc[notion_id, "已缴次数"]),
+                    "状态": _normalize_val(self.odr.df.loc[notion_id, "状态"]),
+                }
+
+                if action == "paid":
                     t = self.odr.df.loc[notion_id, "下次续费时间"]
                     self.odr.df.loc[notion_id, "下次续费时间"] = (
                         pd.to_datetime(t) + pd.DateOffset(years=1)
@@ -202,17 +240,104 @@ class InsuranceTracker:
                     if str(period).isdigit() and new_count >= int(period):
                         self.odr.update_where_index(IS=notion_id, SET="状态", TO="已缴满")
 
-                case "destory":
+                elif action == "destory":
                     self.odr.update_where_index(IS=notion_id, SET="状态", TO="失效")
 
-            self.odr.df.loc[notion_id, "slack时间戳"] = None
-            self.odr.writes()
+                self.odr.df.loc[notion_id, "slack时间戳"] = None
 
-            if response_url:
-                ok_blocks = self.renderer.render_updated_blocks(blocks, "ok")
-                self.slack.post_response(response_url, blocks=ok_blocks)
+                # Snapshot post state after mutations
+                post = {
+                    "下次续费时间": _normalize_val(self.odr.df.loc[notion_id, "下次续费时间"]),
+                    "已缴次数": _normalize_val(self.odr.df.loc[notion_id, "已缴次数"]),
+                    "状态": _normalize_val(self.odr.df.loc[notion_id, "状态"]),
+                }
 
-            return {"status": "ok", "action": button, "notion_id": notion_id}
+                self.odr.writes()
+
+                undo_payload = {
+                    "v": 1,
+                    "action": "undo",
+                    "notion_id": notion_id,
+                    "prev": prev,
+                    "post": post,
+                }
+                undo_value = json.dumps(undo_payload, ensure_ascii=False, separators=(",", ":"))
+                action_label = "已缴费" if action == "paid" else "保单失效"
+
+                if response_url:
+                    undo_blocks = self.renderer.render_success_with_undo(
+                        blocks, undo_value=undo_value, action_label=action_label
+                    )
+                    self.slack.post_response(response_url, blocks=undo_blocks)
+
+                return {
+                    "status": "ok",
+                    "action": action,
+                    "notion_id": notion_id,
+                    "undo_payload": undo_payload,
+                }
+
+            elif action == "undo":
+                if not action_data or "prev" not in action_data or "post" not in action_data:
+                    raise ValueError("Undo payload missing required 'prev' or 'post' snapshot")
+
+                prev = action_data["prev"]
+                post = action_data["post"]
+
+                # Optimistic concurrency check: verify current Notion state matches 'post'
+                current_state = {
+                    "下次续费时间": _normalize_val(self.odr.df.loc[notion_id, "下次续费时间"]),
+                    "已缴次数": _normalize_val(self.odr.df.loc[notion_id, "已缴次数"]),
+                    "状态": _normalize_val(self.odr.df.loc[notion_id, "状态"]),
+                }
+
+                if current_state != post:
+                    logger.warning(
+                        "Undo conflict detected for notion_id %s: current=%s != post=%s",
+                        notion_id,
+                        current_state,
+                        post,
+                    )
+                    if response_url:
+                        conflict_blocks = self.renderer.render_conflict_message(
+                            blocks,
+                            message="数据在此次操作后已被外部修改，无法自动撤销，请前往 Notion 手动核对确认。",
+                        )
+                        self.slack.post_response(response_url, blocks=conflict_blocks)
+                    return {
+                        "status": "conflict",
+                        "action": "undo",
+                        "notion_id": notion_id,
+                        "current": current_state,
+                        "post": post,
+                    }
+
+                # Safe to restore: apply prev values back to Notion
+                for col, val in prev.items():
+                    self.odr.update_where_index(IS=notion_id, SET=col, TO=val)
+
+                # Restore slack时间戳 to the current Slack message ts so it becomes active again
+                msg_ts = (
+                    payload.get("container", {}).get("message_ts")
+                    or payload.get("message", {}).get("ts")
+                )
+                if msg_ts:
+                    try:
+                        self.odr.df.loc[notion_id, "slack时间戳"] = float(msg_ts)
+                    except Exception:
+                        self.odr.df.loc[notion_id, "slack时间戳"] = msg_ts
+
+                self.odr.writes()
+
+                if response_url:
+                    restored_blocks = self.renderer.render_restored_buttons(blocks)
+                    self.slack.post_response(response_url, blocks=restored_blocks)
+
+                return {"status": "ok", "action": "undo", "notion_id": notion_id}
+
+            else:
+                logger.warning("Unrecognized interactive action: %s", action)
+                return {"status": "ignored", "action": action, "notion_id": notion_id}
 
         except UserWarning as e:
             logger.warning("UserWarning during action handling: %s", e)
@@ -220,7 +345,7 @@ class InsuranceTracker:
                 channel=self.config.slack_channel,
                 text=f"<@{self.config.slack_admin_id}>, {e}",
             )
-            return {"status": "warning", "action": button, "notion_id": notion_id, "error": str(e)}
+            return {"status": "warning", "action": action, "notion_id": notion_id, "error": str(e)}
 
         except Exception as e:
             logger.error("Error during action handling: %s", e, exc_info=True)

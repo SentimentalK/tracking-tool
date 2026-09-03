@@ -194,10 +194,13 @@ def test_action_paid_standard():
     assert row["状态"] == "有效保单"  # 3 < 10, not yet complete
     assert pd.isna(row["slack时间戳"]) or row["slack时间戳"] is None
 
-    # Verify webhook responses: first "working", then "ok"
+    # Verify webhook responses: first "working", then "ok" with undo button
     assert len(slack.post_responses) == 2
     assert slack.post_responses[0]["blocks"][-1]["text"]["text"] == ":pray: 数据同步中"
-    assert slack.post_responses[1]["blocks"][-1]["text"]["text"] == ":white_check_mark: 数据同步成功"
+    assert "数据同步成功" in slack.post_responses[1]["blocks"][-2]["text"]["text"]
+    undo_button = slack.post_responses[1]["blocks"][-1]["elements"][0]
+    assert undo_button["text"]["text"] == "↩️ 撤销操作 (Undo)"
+    assert len(undo_button["value"]) <= 2000
 
 
 def test_action_paid_transition_to_complete():
@@ -319,3 +322,196 @@ def test_renderer_output():
     assert "终身" in section_text
     assert "2200-12-31" not in section_text
     assert "<@U12345>" in section_text
+
+
+def test_undo_paid_restores_original_state():
+    tracker, slack = create_mock_tracker()
+    notion_id = "11111111-1111-1111-1111-111111111111"
+
+    # Step 1: Execute paid action
+    paid_payload = {
+        "actions": [{"value": "paid"}],
+        "response_url": "https://hooks.slack.com/actions/123/456",
+        "container": {"message_ts": "1788888888.123456"},
+        "message": {
+            "ts": "1788888888.123456",
+            "blocks": [
+                {"type": "context", "elements": [{"text": f"notion_id: {notion_id}"}]},
+                {"type": "actions", "block_id": "policy_actions", "elements": []},
+            ],
+        },
+    }
+
+    res = tracker.handle_action(paid_payload)
+    assert res["status"] == "ok"
+    undo_payload_obj = res["undo_payload"]
+
+    # Verify state after paid: count=3, date=2027-05-10
+    row_after_paid = tracker.odr.df.loc[notion_id]
+    assert row_after_paid["已缴次数"] == 3
+    assert row_after_paid["下次续费时间"] == "2027-05-10"
+    assert pd.isna(row_after_paid["slack时间戳"]) or row_after_paid["slack时间戳"] is None
+
+    # Step 2: User clicks [Undo]
+    import json
+    undo_button_value = json.dumps(undo_payload_obj, ensure_ascii=False)
+    assert len(undo_button_value) <= 2000
+
+    undo_request_payload = {
+        "actions": [{"value": undo_button_value}],
+        "response_url": "https://hooks.slack.com/actions/123/456",
+        "container": {"message_ts": "1788888888.123456"},
+        "message": {
+            "ts": "1788888888.123456",
+            "blocks": slack.post_responses[-1]["blocks"],
+        },
+    }
+
+    undo_res = tracker.handle_action(undo_request_payload)
+    assert undo_res["status"] == "ok"
+
+    # Verify state after undo: count=2, date=2026-05-10, slack时间戳 restored
+    row_after_undo = tracker.odr.df.loc[notion_id]
+    assert row_after_undo["已缴次数"] == 2
+    assert row_after_undo["下次续费时间"] == "2026-05-10"
+    assert row_after_undo["状态"] == "有效保单"
+    assert row_after_undo["slack时间戳"] == 1788888888.123456
+
+    # Verify restored buttons on Slack card
+    last_response_blocks = slack.post_responses[-1]["blocks"]
+    action_block = [b for b in last_response_blocks if b.get("block_id") == "policy_actions"][0]
+    assert action_block["elements"][0]["value"] == "paid"
+    assert action_block["elements"][1]["value"] == "destory"
+
+
+def test_undo_paid_transition_from_complete():
+    tracker, slack = create_mock_tracker()
+    notion_id = "11111111-1111-1111-1111-111111111111"
+    tracker.odr.df.loc[notion_id, "已缴次数"] = 9  # 缴费期间 is "10"
+
+    paid_payload = {
+        "actions": [{"value": "paid"}],
+        "response_url": "https://hooks.slack.com/actions/123/456",
+        "message": {
+            "ts": "123.456",
+            "blocks": [
+                {"type": "context", "elements": [{"text": f"notion_id: {notion_id}"}]},
+                {"type": "actions", "block_id": "policy_actions", "elements": []},
+            ],
+        },
+    }
+
+    res = tracker.handle_action(paid_payload)
+    assert tracker.odr.df.loc[notion_id, "状态"] == "已缴满"
+
+    # Click Undo
+    import json
+    undo_payload_obj = res["undo_payload"]
+    undo_request = {
+        "actions": [{"value": json.dumps(undo_payload_obj)}],
+        "response_url": "https://hooks.slack.com/actions/123/456",
+        "message": {
+            "ts": "123.456",
+            "blocks": slack.post_responses[-1]["blocks"],
+        },
+    }
+
+    undo_res = tracker.handle_action(undo_request)
+    assert undo_res["status"] == "ok"
+    assert tracker.odr.df.loc[notion_id, "已缴次数"] == 9
+    assert tracker.odr.df.loc[notion_id, "状态"] == "有效保单"
+
+
+def test_undo_destory_restores_active_policy():
+    tracker, slack = create_mock_tracker()
+    notion_id = "22222222-2222-2222-2222-222222222222"
+
+    destory_payload = {
+        "actions": [{"value": "destory"}],
+        "response_url": "https://hooks.slack.com/actions/123/456",
+        "message": {
+            "ts": "123.456",
+            "blocks": [
+                {"type": "context", "elements": [{"text": f"notion_id: {notion_id}"}]},
+                {"type": "actions", "block_id": "policy_actions", "elements": []},
+            ],
+        },
+    }
+
+    res = tracker.handle_action(destory_payload)
+    assert tracker.odr.df.loc[notion_id, "状态"] == "失效"
+
+    import json
+    undo_payload_obj = res["undo_payload"]
+    undo_request = {
+        "actions": [{"value": json.dumps(undo_payload_obj)}],
+        "response_url": "https://hooks.slack.com/actions/123/456",
+        "message": {
+            "ts": "123.456",
+            "blocks": slack.post_responses[-1]["blocks"],
+        },
+    }
+
+    undo_res = tracker.handle_action(undo_request)
+    assert undo_res["status"] == "ok"
+    assert tracker.odr.df.loc[notion_id, "状态"] == "有效保单"
+
+
+def test_undo_concurrency_conflict_refuses_overwrite():
+    tracker, slack = create_mock_tracker()
+    notion_id = "11111111-1111-1111-1111-111111111111"
+
+    # Step 1: Execute paid
+    paid_payload = {
+        "actions": [{"value": "paid"}],
+        "response_url": "https://hooks.slack.com/actions/123/456",
+        "message": {
+            "ts": "123.456",
+            "blocks": [
+                {"type": "context", "elements": [{"text": f"notion_id: {notion_id}"}]},
+                {"type": "actions", "block_id": "policy_actions", "elements": []},
+            ],
+        },
+    }
+    res = tracker.handle_action(paid_payload)
+    undo_payload_obj = res["undo_payload"]
+
+    # Step 2: Simulate external concurrent manual edit in Notion (e.g. admin changed count to 5)
+    tracker.odr.df.loc[notion_id, "已缴次数"] = 5
+
+    # Step 3: User clicks Undo
+    import json
+    undo_request = {
+        "actions": [{"value": json.dumps(undo_payload_obj)}],
+        "response_url": "https://hooks.slack.com/actions/123/456",
+        "message": {
+            "ts": "123.456",
+            "blocks": slack.post_responses[-1]["blocks"],
+        },
+    }
+
+    undo_res = tracker.handle_action(undo_request)
+    # Must refuse overwrite!
+    assert undo_res["status"] == "conflict"
+    # Current Notion count must remain 5, not reverted to 2!
+    assert tracker.odr.df.loc[notion_id, "已缴次数"] == 5
+
+    # Verify conflict warning block sent to Slack
+    last_response_blocks = slack.post_responses[-1]["blocks"]
+    conflict_block = [b for b in last_response_blocks if b.get("block_id") == "policy_conflict"][0]
+    assert "外部修改" in conflict_block["text"]["text"]
+
+
+def test_json_normalization_handles_numpy_and_nans():
+    import numpy as np
+    from apps.insurance.workflow import _normalize_val
+
+    assert _normalize_val(np.int64(10)) == 10
+    assert isinstance(_normalize_val(np.int64(10)), int)
+    assert _normalize_val(np.float64(3.14)) == 3.14
+    assert _normalize_val(pd.Timestamp("2026-05-10")) == "2026-05-10"
+    assert _normalize_val(pd.NA) is None
+    assert _normalize_val(float("nan")) is None
+    assert _normalize_val(None) is None
+    assert _normalize_val("有效保单") == "有效保单"
+

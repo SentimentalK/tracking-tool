@@ -57,6 +57,11 @@ tests/
 6. **Interactive Action `destory`**:
    * `状态 = 失效`
    * `slack时间戳` = None
+7. **Interactive Action `undo` (Optimistic Concurrency Rollback)**:
+   * Action button value embeds `{ "v": 1, "action": "undo", "notion_id": "...", "prev": {...}, "post": {...} }`
+   * Optimistic check: verifies current Notion record equals `post` snapshot before rolling back.
+   * On match: rolls back fields to `prev`, restores `slack时间戳 = message_ts`, and restores active buttons.
+   * On mismatch: safely refuses rollback, preserves Notion data, and posts conflict warning.
 
 ### Python APIs
 ```python
