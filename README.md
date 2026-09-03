@@ -7,8 +7,11 @@ Internal repository for syncing Notion databases and Slack reminders.
 All secrets are managed via Infisical. Do not write credentials into code or `.env`.
 
 ```bash
-# Run daily sync with prod secrets
+# Run daily sync with prod secrets (CronJob)
 infisical run --env=prod -- .venv/bin/python main.py
+
+# Run FastAPI webhook server (24x7 Deployment)
+infisical run --env=prod -- .venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000
 
 # Run unit tests (offline, fully mocked)
 .venv/bin/pytest -v tests/
@@ -17,6 +20,7 @@ infisical run --env=prod -- .venv/bin/python main.py
 ### Injected Secrets (Infisical)
 * `NOTION_TOKEN`: Notion API integration token
 * `SLACK_TOKEN`: Slack Bot OAuth token
+* `SLACK_SIGNING_SECRET`: Slack signing secret (for validating incoming webhooks)
 * `SLACK_ADMIN`: Slack Admin User ID (`U034H72T319`)
 * `SLACK_USER`: Target user ID for reminder mentions (`U034EB7UKEZ`)
 
@@ -25,7 +29,8 @@ infisical run --env=prod -- .venv/bin/python main.py
 ## Architecture & Entrypoints (Quick Reference)
 
 ```text
-main.py                  # CLI entrypoint for daily sync routine
+main.py                  # CLI entrypoint for daily sync routine (CronJob)
+server.py                # FastAPI webhook server (Deployment): /slack/interactions, /healthz
 tracker/
   notion.py              # Table ↔ pandas DataFrame diff sync (lazy-load, writes())
   slack.py               # SlackClient (chat_postMessage, delete, parse_interactive_payload)
@@ -36,6 +41,7 @@ apps/insurance/
   config.py              # Insurance DB IDs (Company, Product, People, Order)
 tests/
   test_insurance.py      # Unit tests (reminders, monday overdue, paid, destory, expiration)
+  test_server.py         # Unit tests for FastAPI server (healthz, signing verifier, 200 ACK)
 ```
 
 ### Core Business Rules
