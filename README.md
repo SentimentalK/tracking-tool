@@ -7,8 +7,12 @@ Internal repository for syncing Notion databases and Slack reminders.
 All secrets are managed via Infisical. Do not write credentials into code or `.env`.
 
 ```bash
-# Run daily sync with prod secrets (CronJob)
+# Run insurance daily sync with prod secrets (CronJob)
 infisical run --env=prod -- .venv/bin/python main.py
+
+# Run birthday daily reminders (dry run or live)
+infisical run --env=prod -- .venv/bin/python main.py --app birthday --dry-run
+infisical run --env=prod -- .venv/bin/python main.py --app birthday
 
 # Run FastAPI webhook server (24x7 Deployment)
 infisical run --env=prod -- .venv/bin/uvicorn server:app --host 0.0.0.0 --port 8000
@@ -29,7 +33,7 @@ infisical run --env=prod -- .venv/bin/uvicorn server:app --host 0.0.0.0 --port 8
 ## Architecture & Entrypoints (Quick Reference)
 
 ```text
-main.py                  # CLI entrypoint for daily sync routine (CronJob)
+main.py                  # Multi-app CLI entrypoint (--app insurance|birthday, --dry-run)
 server.py                # FastAPI webhook server (Deployment): /slack/interactions, /healthz
 tracker/
   notion.py              # Table ↔ pandas DataFrame diff sync (lazy-load, writes())
@@ -37,10 +41,14 @@ tracker/
   config.py              # Validates NOTION_TOKEN and SLACK_TOKEN in os.environ
 apps/insurance/
   workflow.py            # run_daily(), handle_action(payload)
-  renderer.py            # Block Kit card builder ('paid', 'destory' actions)
+  renderer.py            # Block Kit card builder ('paid', 'destory', 'undo' actions)
   config.py              # Insurance DB IDs (Company, Product, People, Order)
+apps/birthday/
+  workflow.py            # run_daily(dry_run=...), occurrence & age calculations
+  config.py              # Birthday config (channel: #生日提醒, People DB ID, timezone)
 tests/
-  test_insurance.py      # Unit tests (reminders, monday overdue, paid, destory, expiration)
+  test_insurance.py      # Unit tests (reminders, monday overdue, paid, destory, undo)
+  test_birthday.py       # Unit tests (on the day, advance 10d, 1900 sentinel, leap year, dry-run)
   test_server.py         # Unit tests for FastAPI server (healthz, signing verifier, 200 ACK)
 ```
 
