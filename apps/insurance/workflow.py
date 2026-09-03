@@ -142,41 +142,56 @@ class InsuranceTracker:
             new_ts = float(res.get("ts", 0.0))
             self.odr.update_where_index(IS=notion_id, SET="slack时间戳", TO=new_ts)
 
-    def run_daily(self) -> Dict[str, Any]:
+    def run_daily(
+        self, force_unpaid: bool = False, dry_run: bool = False
+    ) -> Dict[str, Any]:
         """Execute daily insurance routine: check renewals, send reminders, expire overdue."""
         df = self.odr.df[self.odr.df["状态"] == "有效保单"]
         unpaid = df[(df["缴费倒计时"] < 0) & (df["缴费倒计时"] >= -90)]
         short_period = df[df["缴费倒计时"].isin([0, 1, 8, 15])]
         invalid = df[df["缴费倒计时"] < -90]
 
-        # Expire overdue policies beyond 90 days
-        for notion_id in invalid.index:
-            self.odr.update_where_index(IS=notion_id, SET="状态", TO="失效")
-
-        # Send standard countdown reminders
-        self.send_reminders(short_period)
-
-        # Send unpaid reminders on Monday in configured timezone
         is_monday = (
             pd.Timestamp.now(self.config.timezone).tz_localize(None).weekday() == 0
         )
-        if is_monday:
-            self.send_reminders(unpaid)
+        should_send_unpaid = is_monday or force_unpaid
 
-        try:
-            self.odr.writes()
-        except UserWarning as e:
-            logger.warning("UserWarning during odr.writes: %s", e)
-            self.slack.send_message(
-                channel=self.config.slack_channel,
-                text=f"<@{self.config.slack_admin_id}>, {e}",
+        if dry_run:
+            logger.info(
+                "[DRY-RUN] Insurance Daily Routine: valid=%d, short_period=%d, unpaid=%d (send=%s), expired=%d",
+                len(df),
+                len(short_period),
+                len(unpaid),
+                should_send_unpaid,
+                len(invalid),
             )
+        else:
+            # Expire overdue policies beyond 90 days
+            for notion_id in invalid.index:
+                self.odr.update_where_index(IS=notion_id, SET="状态", TO="失效")
+
+            # Send standard countdown reminders
+            self.send_reminders(short_period)
+
+            # Send unpaid reminders on Monday (or when forced)
+            if should_send_unpaid:
+                self.send_reminders(unpaid)
+
+            try:
+                self.odr.writes()
+            except UserWarning as e:
+                logger.warning("UserWarning during odr.writes: %s", e)
+                self.slack.send_message(
+                    channel=self.config.slack_channel,
+                    text=f"<@{self.config.slack_admin_id}>, {e}",
+                )
 
         return {
             "valid_policies": len(df),
             "short_period_reminders": len(short_period),
-            "unpaid_reminders": len(unpaid) if is_monday else 0,
+            "unpaid_reminders": len(unpaid) if should_send_unpaid else 0,
             "expired": len(invalid),
+            "dry_run": dry_run,
         }
 
     def handle_action(
@@ -355,10 +370,14 @@ class InsuranceTracker:
             raise
 
 
-def run_daily(config: Optional[InsuranceConfig] = None) -> Dict[str, Any]:
+def run_daily(
+    config: Optional[InsuranceConfig] = None,
+    force_unpaid: bool = False,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
     """Convenience functional API to run daily insurance routine."""
     tracker = InsuranceTracker(config=config)
-    return tracker.run_daily()
+    return tracker.run_daily(force_unpaid=force_unpaid, dry_run=dry_run)
 
 
 def handle_action(

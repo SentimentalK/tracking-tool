@@ -169,6 +169,32 @@ def test_monday_overdue_reminders():
         assert len(slack.sent_messages) == 3
 
 
+def test_force_unpaid_and_dry_run_reminders():
+    tracker, slack = create_mock_tracker()
+
+    # Freeze day to Wednesday (weekday=2)
+    with patch("pandas.Timestamp.now") as mock_now:
+        mock_dt = pd.Timestamp("2026-05-13 10:00:00", tz="Asia/Shanghai")
+        mock_now.return_value = mock_dt
+
+        # When force_unpaid=True, POL004 (-10) should trigger even on Wednesday
+        metrics = tracker.run_daily(force_unpaid=True, dry_run=False)
+        assert metrics["short_period_reminders"] == 2
+        assert metrics["unpaid_reminders"] == 1
+        assert len(slack.sent_messages) == 3
+
+    # Test dry_run=True: zero messages sent, nothing written
+    tracker_dry, slack_dry = create_mock_tracker()
+    with patch("pandas.Timestamp.now") as mock_now:
+        mock_dt = pd.Timestamp("2026-05-13 10:00:00", tz="Asia/Shanghai")
+        mock_now.return_value = mock_dt
+
+        metrics_dry = tracker_dry.run_daily(force_unpaid=True, dry_run=True)
+        assert metrics_dry["dry_run"] is True
+        assert len(slack_dry.sent_messages) == 0
+        assert len(tracker_dry.odr.written_changes) == 0
+
+
 def test_action_paid_standard():
     tracker, slack = create_mock_tracker()
     notion_id = "11111111-1111-1111-1111-111111111111"

@@ -40,8 +40,12 @@ def main() -> None:
         sys.exit(1)
 
     if args.app == "insurance":
-        logger.info("Executing Insurance Daily Routine (force_unpaid=%s)...", args.force_unpaid)
-        result = run_insurance_daily(force_unpaid=args.force_unpaid)
+        logger.info(
+            "Executing Insurance Daily Routine (force_unpaid=%s, dry_run=%s)...",
+            args.force_unpaid,
+            args.dry_run,
+        )
+        result = run_insurance_daily(force_unpaid=args.force_unpaid, dry_run=args.dry_run)
         logger.info("Completed Insurance Daily Tracker: %s", result)
     elif args.app == "birthday":
         logger.info("Executing Birthday Daily Routine (dry_run=%s)...", args.dry_run)
