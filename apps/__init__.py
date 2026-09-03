@@ -1,0 +1,1 @@
+# Multi-app registry package

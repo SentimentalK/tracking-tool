@@ -1,0 +1,321 @@
+from unittest.mock import patch
+import pandas as pd
+import pytest
+
+from apps.insurance.config import InsuranceConfig
+from apps.insurance.renderer import InsuranceRenderer
+from apps.insurance.workflow import InsuranceTracker
+from tests.conftest import MockSlackClient, MockTable
+from tracker.config import load_env_secrets
+from tracker.slack import SlackClient
+
+
+def build_sample_order_df():
+    return pd.DataFrame([
+        {
+            "notion_id": "11111111-1111-1111-1111-111111111111",
+            "保单号": "POL001",
+            "状态": "有效保单",
+            "缴费倒计时": 0,
+            "下次续费时间": "2026-05-10",
+            "保费": 5000,
+            "缴费期间": "10",
+            "最晚缴费时间": "2026-07-10",
+            "已缴次数": 2,
+            "投保人|姓名": "张三",
+            "被保险人|姓名": "李四",
+            "投保险种产品名称|产品名称": "重大疾病险",
+            "slack时间戳": 12345.0,
+        },
+        {
+            "notion_id": "22222222-2222-2222-2222-222222222222",
+            "保单号": "POL002",
+            "状态": "有效保单",
+            "缴费倒计时": 8,
+            "下次续费时间": "2026-05-18",
+            "保费": 3000,
+            "缴费期间": "20",
+            "最晚缴费时间": "2026-07-18",
+            "已缴次数": 5,
+            "投保人|姓名": "张三",
+            "被保险人|姓名": "张三",
+            "投保险种产品名称|产品名称": "意外险",
+            "slack时间戳": None,
+        },
+        {
+            "notion_id": "33333333-3333-3333-3333-333333333333",
+            "保单号": "POL003",
+            "状态": "有效保单",
+            "缴费倒计时": 5,  # Not in [0, 1, 8, 15]
+            "下次续费时间": "2026-05-15",
+            "保费": 2000,
+            "缴费期间": "10",
+            "最晚缴费时间": "2026-07-15",
+            "已缴次数": 1,
+            "投保人|姓名": "王五",
+            "被保险人|姓名": "王五",
+            "投保险种产品名称|产品名称": "医疗险",
+            "slack时间戳": None,
+        },
+        {
+            "notion_id": "44444444-4444-4444-4444-444444444444",
+            "保单号": "POL004",
+            "状态": "有效保单",
+            "缴费倒计时": -10,  # Overdue within 90 days
+            "下次续费时间": "2026-04-20",
+            "保费": 4000,
+            "缴费期间": "15",
+            "最晚缴费时间": "2026-06-20",
+            "已缴次数": 3,
+            "投保人|姓名": "张三",
+            "被保险人|姓名": "张三",
+            "投保险种产品名称|产品名称": "人寿险",
+            "slack时间戳": None,
+        },
+        {
+            "notion_id": "55555555-5555-5555-5555-555555555555",
+            "保单号": "POL005",
+            "状态": "有效保单",
+            "缴费倒计时": -95,  # Exceeded 90 days overdue
+            "下次续费时间": "2026-01-20",
+            "保费": 4000,
+            "缴费期间": "15",
+            "最晚缴费时间": "2026-03-20",
+            "已缴次数": 3,
+            "投保人|姓名": "张三",
+            "被保险人|姓名": "张三",
+            "投保险种产品名称|产品名称": "人寿险",
+            "slack时间戳": None,
+        },
+    ])
+
+
+def build_sample_people_df():
+    return pd.DataFrame([
+        {"notion_id": "p1", "姓名": "张三", "年龄": 35, "生日": "1991-01-01"},
+        {"notion_id": "p2", "姓名": "李四", "年龄": 30, "生日": "1996-02-02"},
+        {"notion_id": "p3", "姓名": "王五", "年龄": 40, "生日": "1986-03-03"},
+    ])
+
+
+def create_mock_tracker():
+    order_df = build_sample_order_df()
+    people_df = build_sample_people_df()
+    slack = MockSlackClient()
+    config = InsuranceConfig()
+
+    with patch("apps.insurance.workflow.Table") as mock_table_cls:
+        tracker = InsuranceTracker(config=config, slack_client=slack)
+        tracker.odr = MockTable(order_df)
+        tracker.ppl = MockTable(people_df)
+        return tracker, slack
+
+
+def test_env_secrets_validation(monkeypatch):
+    monkeypatch.delenv("NOTION_TOKEN", raising=False)
+    monkeypatch.delenv("SLACK_TOKEN", raising=False)
+    with pytest.raises(ValueError, match="Missing required environment variable"):
+        load_env_secrets()
+
+    monkeypatch.setenv("NOTION_TOKEN", "mock-notion-token")
+    monkeypatch.setenv("SLACK_TOKEN", "mock-slack-token")
+    secrets = load_env_secrets()
+    assert secrets.notion_token == "mock-notion-token"
+    assert secrets.slack_token == "mock-slack-token"
+
+
+def test_countdown_reminders_and_expiration():
+    tracker, slack = create_mock_tracker()
+
+    # Freeze day to non-Monday (e.g. Wednesday, weekday=2)
+    with patch("pandas.Timestamp.now") as mock_now:
+        mock_dt = pd.Timestamp("2026-05-13 10:00:00", tz="Asia/Shanghai")
+        mock_now.return_value = mock_dt
+
+        metrics = tracker.run_daily()
+
+        # POL001 (0 days) and POL002 (8 days) should trigger reminders
+        # POL003 (5 days) should not trigger
+        # POL004 (-10 days) should not trigger on Wednesday
+        assert metrics["short_period_reminders"] == 2
+        assert metrics["unpaid_reminders"] == 0
+        assert metrics["expired"] == 1
+
+        # POL001 had an existing slack timestamp: 12345.0, so it should have been deleted
+        assert len(slack.deleted_messages) == 1
+        assert slack.deleted_messages[0]["ts"] == "12345.0"
+
+        # 2 reminder messages sent in total
+        assert len(slack.sent_messages) == 2
+
+        # POL005 should be marked as "失效"
+        assert tracker.odr.df.loc["55555555-5555-5555-5555-555555555555", "状态"] == "失效"
+
+
+def test_monday_overdue_reminders():
+    tracker, slack = create_mock_tracker()
+
+    # Freeze day to Monday (e.g. 2026-05-11, weekday=0)
+    with patch("pandas.Timestamp.now") as mock_now:
+        mock_dt = pd.Timestamp("2026-05-11 10:00:00", tz="Asia/Shanghai")
+        mock_now.return_value = mock_dt
+
+        metrics = tracker.run_daily()
+
+        # POL001 (0) + POL002 (8) = 2 short period
+        # POL004 (-10) = 1 unpaid reminder
+        assert metrics["short_period_reminders"] == 2
+        assert metrics["unpaid_reminders"] == 1
+        assert len(slack.sent_messages) == 3
+
+
+def test_action_paid_standard():
+    tracker, slack = create_mock_tracker()
+    notion_id = "11111111-1111-1111-1111-111111111111"
+
+    # Initial state: 次数=2, 下次续费时间=2026-05-10
+    payload = {
+        "actions": [{"value": "paid"}],
+        "response_url": "https://hooks.slack.com/actions/123/456",
+        "message": {
+            "blocks": [
+                {"type": "context", "elements": [{"text": f"notion_id: {notion_id}"}]},
+                {"type": "actions", "elements": []},
+            ]
+        },
+    }
+
+    result = tracker.handle_action(payload)
+    assert result["status"] == "ok"
+
+    row = tracker.odr.df.loc[notion_id]
+    assert row["已缴次数"] == 3
+    assert row["下次续费时间"] == "2027-05-10"
+    assert row["状态"] == "有效保单"  # 3 < 10, not yet complete
+    assert pd.isna(row["slack时间戳"]) or row["slack时间戳"] is None
+
+    # Verify webhook responses: first "working", then "ok"
+    assert len(slack.post_responses) == 2
+    assert slack.post_responses[0]["blocks"][-1]["text"]["text"] == ":pray: 数据同步中"
+    assert slack.post_responses[1]["blocks"][-1]["text"]["text"] == ":white_check_mark: 数据同步成功"
+
+
+def test_action_paid_transition_to_complete():
+    tracker, slack = create_mock_tracker()
+    notion_id = "11111111-1111-1111-1111-111111111111"
+
+    # Set 已缴次数 to 9, 缴费期间 is "10"
+    tracker.odr.df.loc[notion_id, "已缴次数"] = 9
+
+    payload = {
+        "actions": [{"value": "paid"}],
+        "response_url": "https://hooks.slack.com/actions/123/456",
+        "message": {
+            "blocks": [
+                {"type": "context", "elements": [{"text": f"notion_id: {notion_id}"}]},
+                {"type": "actions", "elements": []},
+            ]
+        },
+    }
+
+    tracker.handle_action(payload)
+    row = tracker.odr.df.loc[notion_id]
+    assert row["已缴次数"] == 10
+    assert row["状态"] == "已缴满"
+
+
+def test_action_paid_non_integer_period_does_not_complete():
+    tracker, slack = create_mock_tracker()
+    notion_id = "11111111-1111-1111-1111-111111111111"
+
+    # Set 缴费期间 to "终身"
+    tracker.odr.df.loc[notion_id, "缴费期间"] = "终身"
+    tracker.odr.df.loc[notion_id, "已缴次数"] = 99
+
+    payload = {
+        "actions": [{"value": "paid"}],
+        "response_url": "https://hooks.slack.com/actions/123/456",
+        "message": {
+            "blocks": [
+                {"type": "context", "elements": [{"text": f"notion_id: {notion_id}"}]},
+                {"type": "actions", "elements": []},
+            ]
+        },
+    }
+
+    tracker.handle_action(payload)
+    row = tracker.odr.df.loc[notion_id]
+    assert row["已缴次数"] == 100
+    assert row["状态"] == "有效保单"
+
+
+def test_action_destory():
+    tracker, slack = create_mock_tracker()
+    notion_id = "22222222-2222-2222-2222-222222222222"
+
+    payload = {
+        "actions": [{"value": "destory"}],
+        "response_url": "https://hooks.slack.com/actions/123/456",
+        "message": {
+            "blocks": [
+                {"type": "context", "elements": [{"text": f"notion_id: {notion_id}"}]},
+                {"type": "actions", "elements": []},
+            ]
+        },
+    }
+
+    result = tracker.handle_action(payload)
+    assert result["status"] == "ok"
+
+    row = tracker.odr.df.loc[notion_id]
+    assert row["状态"] == "失效"
+    assert pd.isna(row["slack时间戳"]) or row["slack时间戳"] is None
+
+
+def test_slack_interactive_payload_parsing():
+    raw_dict = {"actions": [{"value": "paid"}]}
+    assert SlackClient.parse_interactive_payload(raw_dict) == raw_dict
+
+    # URL encoded payload=...
+    import json
+    import urllib.parse
+    import base64
+
+    json_str = json.dumps({"actions": [{"value": "destory"}]})
+    url_encoded = f"payload={urllib.parse.quote(json_str)}"
+    assert SlackClient.parse_interactive_payload(url_encoded)["actions"][0]["value"] == "destory"
+
+    # Base64 encoded payload
+    b64_encoded = base64.b64encode(url_encoded.encode("ascii")).decode("ascii")
+    assert SlackClient.parse_interactive_payload(b64_encoded)["actions"][0]["value"] == "destory"
+
+
+def test_renderer_output():
+    renderer = InsuranceRenderer(user_id="U12345", admin_id="U99999")
+    blocks = renderer.render_reminder_card(
+        notion_id="notion-123",
+        policy_no="P-100",
+        applicant_name="张三",
+        applicant_age=30,
+        applicant_birthday="1990-01-01",
+        insured_name="李四",
+        insured_age=5,
+        insured_birthday="2021-01-01",
+        product_name="少儿成长险",
+        next_pay_date="2200-12-31",  # should be replaced with 终身
+        countdown=8,
+        premium=1200,
+        payment_period="10",
+        latest_pay_date="2200-12-31",
+    )
+
+    # Check button values
+    action_block = blocks[-1]
+    assert action_block["elements"][0]["value"] == "paid"
+    assert action_block["elements"][1]["value"] == "destory"
+
+    # Check 2200-12-31 replaced by 终身
+    section_text = blocks[3]["text"]["text"]
+    assert "终身" in section_text
+    assert "2200-12-31" not in section_text
+    assert "<@U12345>" in section_text
